@@ -21,6 +21,7 @@
 #include <errno.h>
 #include <poll.h>
 #include <sys/ioctl.h>
+#include <sys/socket.h>
 #include <net/if.h>
 #include <linux/dvb/frontend.h>
 #include <linux/dvb/dmx.h>
@@ -49,6 +50,47 @@ static void signal_handler(int sig)
 	running = 0;
 }
 
+/*
+ * The wildcard-PID (0x2000) ALP demux feed that it930x_alp_open()/
+ * it930x_alp_stop() create/destroy is tied to this netdev's own
+ * ndo_open/ndo_stop (alp.c), NOT to the frontend fd's open/close
+ * lifecycle - and that feed goes through the same dvb_usb_start_feed()/
+ * feed_count/ADAP_STREAMING accounting as a normal PID feed. If the
+ * interface is left up when this tool exits, ADAP_STREAMING never
+ * clears, and the next frontend open hangs forever in
+ * dvb_usb_fe_sleep()'s wait_on_bit(ADAP_STREAMING) - a real, previously
+ * undiagnosed root cause for a hang that looked like it needed a reboot
+ * to clear. Always bring the interface down on exit, however we get
+ * there, so nobody has to remember to do it by hand.
+ */
+static int set_alp_iface_up(const char *ifname, int up)
+{
+	struct ifreq ifr;
+	int sock, ret;
+
+	sock = socket(AF_INET, SOCK_DGRAM, 0);
+	if (sock < 0)
+		return -1;
+
+	memset(&ifr, 0, sizeof(ifr));
+	strncpy(ifr.ifr_name, ifname, IFNAMSIZ - 1);
+
+	ret = ioctl(sock, SIOCGIFFLAGS, &ifr);
+	if (ret < 0) {
+		close(sock);
+		return -1;
+	}
+
+	if (up)
+		ifr.ifr_flags |= IFF_UP;
+	else
+		ifr.ifr_flags &= ~IFF_UP;
+
+	ret = ioctl(sock, SIOCSIFFLAGS, &ifr);
+	close(sock);
+	return ret;
+}
+
 static void usage(const char *prog)
 {
 	fprintf(stderr,
@@ -68,7 +110,8 @@ int main(int argc, char **argv)
 	unsigned int freq = 0, bw = 6000000;
 	unsigned int stream_id = NO_STREAM_ID_FILTER;
 	int adapter = 0, frontend = 0, record = 0;
-	char fe_path[64];
+	char fe_path[64], alp_ifname[IFNAMSIZ];
+	int alp_iface_up = 0;
 	int fe_fd, dmx_fd = -1, dvr_fd = -1, i;
 
 	/* Parse arguments */
@@ -193,6 +236,16 @@ int main(int argc, char **argv)
 	else
 		fprintf(stderr, "Tuning %u Hz, all PLPs ...\n", freq);
 
+	/* See set_alp_iface_up()'s comment: bringing this up is what
+	 * actually starts the wildcard ALP feed, and it must come back
+	 * down before we exit or the next frontend open hangs. */
+	snprintf(alp_ifname, sizeof(alp_ifname), "alp%d", adapter);
+	if (set_alp_iface_up(alp_ifname, 1) < 0)
+		fprintf(stderr, "Warning: couldn't bring up %s: %s\n",
+			alp_ifname, strerror(errno));
+	else
+		alp_iface_up = 1;
+
 	/* Set up demux and DVR for recording */
 	if (record) {
 		char dmx_path[64], dvr_path[64];
@@ -309,6 +362,17 @@ int main(int argc, char **argv)
 	fprintf(stderr, "\nStopping.\n");
 
 out:
+	/*
+	 * Always try this, even on an early error path before the main
+	 * loop - alp_iface_up only actually gates whether we succeeded
+	 * in bringing it up in the first place, not whether the rest of
+	 * tuning succeeded, so this can't accidentally skip the one
+	 * cleanup step that matters most for avoiding the next hang.
+	 */
+	if (alp_iface_up && set_alp_iface_up(alp_ifname, 0) < 0)
+		fprintf(stderr, "Warning: couldn't bring down %s: %s\n",
+			alp_ifname, strerror(errno));
+
 	if (dvr_fd >= 0)
 		close(dvr_fd);
 	if (dmx_fd >= 0)
