@@ -14,6 +14,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <ctype.h>
 #include <unistd.h>
 #include <fcntl.h>
 #include <signal.h>
@@ -89,6 +90,39 @@ static int set_alp_iface_up(const char *ifname, int up)
 	ret = ioctl(sock, SIOCSIFFLAGS, &ifr);
 	close(sock);
 	return ret;
+}
+
+/*
+ * alp%d netdev numbering (alloc_netdev() in alp.c) is a separate,
+ * independent sequential counter from DVB adapter numbering - it
+ * increments once per ALP-capable device attached, system-wide, not
+ * per adapter index. With a single tuner it's always "alp0" no matter
+ * which DVB adapter number that tuner happens to enumerate as on a
+ * given boot (which itself can shift across reboots if other DVB
+ * hardware is present). Don't guess "alp<adapter>" - actually look for
+ * whatever alp* interface really exists.
+ */
+static int find_alp_iface(char *ifname, size_t len)
+{
+	struct dirent *ent;
+	DIR *dir;
+	int found = 0;
+
+	dir = opendir("/sys/class/net");
+	if (!dir)
+		return -1;
+
+	while ((ent = readdir(dir)) != NULL) {
+		if (strncmp(ent->d_name, "alp", 3) == 0 &&
+		    isdigit((unsigned char)ent->d_name[3])) {
+			strncpy(ifname, ent->d_name, len - 1);
+			ifname[len - 1] = '\0';
+			found = 1;
+			break;
+		}
+	}
+	closedir(dir);
+	return found ? 0 : -1;
 }
 
 static void usage(const char *prog)
@@ -239,12 +273,15 @@ int main(int argc, char **argv)
 	/* See set_alp_iface_up()'s comment: bringing this up is what
 	 * actually starts the wildcard ALP feed, and it must come back
 	 * down before we exit or the next frontend open hangs. */
-	snprintf(alp_ifname, sizeof(alp_ifname), "alp%d", adapter);
-	if (set_alp_iface_up(alp_ifname, 1) < 0)
+	if (find_alp_iface(alp_ifname, sizeof(alp_ifname)) < 0) {
+		fprintf(stderr,
+			"Warning: no alp* interface found, ALP traffic won't flow\n");
+	} else if (set_alp_iface_up(alp_ifname, 1) < 0) {
 		fprintf(stderr, "Warning: couldn't bring up %s: %s\n",
 			alp_ifname, strerror(errno));
-	else
+	} else {
 		alp_iface_up = 1;
+	}
 
 	/* Set up demux and DVR for recording */
 	if (record) {
