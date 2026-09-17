@@ -167,6 +167,35 @@ static int find_alp_iface(char *ifname, size_t len)
 	return found ? 0 : -1;
 }
 
+/*
+ * Bring the ALP interface up only once real lock is confirmed, not
+ * right after submitting the tune request. Tuning is asynchronous -
+ * the DTV_TUNE ioctl returns almost immediately, while real lock takes
+ * a couple more seconds of polling. it930x_alp_open()'s wildcard-PID
+ * feed starting before the demod has ever locked risked leaving the
+ * USB streaming pipeline in a state that never recovers even once
+ * lock is achieved moments later - matches a real symptom: RF lock
+ * confirmed good (SNR ~28dB), but `ethtool -S alp0` staying all-zero
+ * the whole time, even in auto mode after the auto-mode-lock fix.
+ * *alp_iface_up tracks whether we've already brought it up, so this
+ * is safe to call on every locked poll, not just the first one.
+ */
+static void bring_up_alp_on_lock(char *alp_ifname, size_t len, int *alp_iface_up)
+{
+	if (*alp_iface_up)
+		return;
+
+	if (find_alp_iface(alp_ifname, len) < 0) {
+		fprintf(stderr,
+			"Warning: no alp* interface found, ALP traffic won't flow\n");
+	} else if (set_alp_iface_up(alp_ifname, 1) < 0) {
+		fprintf(stderr, "Warning: couldn't bring up %s: %s\n",
+			alp_ifname, strerror(errno));
+	} else {
+		*alp_iface_up = 1;
+	}
+}
+
 static void usage(const char *prog)
 {
 	fprintf(stderr,
@@ -313,19 +342,6 @@ int main(int argc, char **argv)
 	else
 		fprintf(stderr, "Tuning %u Hz, all PLPs ...\n", freq);
 
-	/* See set_alp_iface_up()'s comment: bringing this up is what
-	 * actually starts the wildcard ALP feed, and it must come back
-	 * down before we exit or the next frontend open hangs. */
-	if (find_alp_iface(alp_ifname, sizeof(alp_ifname)) < 0) {
-		fprintf(stderr,
-			"Warning: no alp* interface found, ALP traffic won't flow\n");
-	} else if (set_alp_iface_up(alp_ifname, 1) < 0) {
-		fprintf(stderr, "Warning: couldn't bring up %s: %s\n",
-			alp_ifname, strerror(errno));
-	} else {
-		alp_iface_up = 1;
-	}
-
 	/* Set up demux and DVR for recording */
 	if (record) {
 		char dmx_path[64], dvr_path[64];
@@ -369,7 +385,12 @@ int main(int argc, char **argv)
 		struct pollfd pfd = { .fd = dvr_fd, .events = POLLIN };
 
 		while (running) {
+			enum fe_status status = 0;
+
 			check_quit_key();
+			if (ioctl(fe_fd, FE_READ_STATUS, &status) == 0 &&
+			    (status & FE_HAS_LOCK))
+				bring_up_alp_on_lock(alp_ifname, sizeof(alp_ifname), &alp_iface_up);
 			if (poll(&pfd, 1, 100) > 0) {
 				ssize_t n = read(dvr_fd, buf, sizeof(buf));
 
@@ -399,6 +420,8 @@ int main(int argc, char **argv)
 
 			if (status & FE_HAS_LOCK) {
 				time_t now = time(NULL);
+
+				bring_up_alp_on_lock(alp_ifname, sizeof(alp_ifname), &alp_iface_up);
 
 				if (now - last_stats >= 5) {
 					struct dtv_property props[3];
