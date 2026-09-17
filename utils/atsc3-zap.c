@@ -5,7 +5,7 @@
  * Tunes a DVB frontend to an ATSC 3.0 channel using DVBv5 ioctls
  * (bypassing dvbv5-zap which cannot handle SYS_ATSC3), brings up
  * the associated atscN network interface on lock, and keeps running
- * until interrupted.
+ * until interrupted (Ctrl+C, or 'q' if run interactively).
  *
  * Usage: atsc3-zap <freq_hz> [--plp <id>[,<id>...]] [-a <adapter>] [-f <frontend>] [-r]
  *
@@ -21,6 +21,7 @@
 #include <dirent.h>
 #include <errno.h>
 #include <poll.h>
+#include <termios.h>
 #include <sys/ioctl.h>
 #include <sys/socket.h>
 #include <net/if.h>
@@ -49,6 +50,47 @@ static void signal_handler(int sig)
 {
 	(void)sig;
 	running = 0;
+}
+
+/*
+ * 'q' to quit, as an alternative to Ctrl+C - both take the same
+ * graceful running=0 exit path, which is what actually runs the
+ * alp-interface cleanup in set_alp_iface_up(). Only touches the
+ * terminal when stdin really is one (skips cleanly under
+ * systemd-run/non-interactive use, where isatty() is false).
+ */
+static struct termios orig_termios;
+static int have_orig_termios;
+
+static void restore_terminal(void)
+{
+	if (have_orig_termios)
+		tcsetattr(STDIN_FILENO, TCSANOW, &orig_termios);
+}
+
+static void set_raw_terminal(void)
+{
+	struct termios raw;
+
+	if (!isatty(STDIN_FILENO))
+		return;
+	if (tcgetattr(STDIN_FILENO, &orig_termios) < 0)
+		return;
+	have_orig_termios = 1;
+
+	raw = orig_termios;
+	raw.c_lflag &= ~(ICANON | ECHO);
+	raw.c_cc[VMIN] = 0;
+	raw.c_cc[VTIME] = 0;
+	tcsetattr(STDIN_FILENO, TCSANOW, &raw);
+}
+
+static void check_quit_key(void)
+{
+	char ch;
+
+	if (read(STDIN_FILENO, &ch, 1) == 1 && (ch == 'q' || ch == 'Q'))
+		running = 0;
 }
 
 /*
@@ -215,6 +257,7 @@ int main(int argc, char **argv)
 	/* Setup signal handlers */
 	signal(SIGINT, signal_handler);
 	signal(SIGTERM, signal_handler);
+	set_raw_terminal();
 
 	/* Clear frontend state */
 	{
@@ -326,6 +369,7 @@ int main(int argc, char **argv)
 		struct pollfd pfd = { .fd = dvr_fd, .events = POLLIN };
 
 		while (running) {
+			check_quit_key();
 			if (poll(&pfd, 1, 100) > 0) {
 				ssize_t n = read(dvr_fd, buf, sizeof(buf));
 
@@ -347,6 +391,7 @@ int main(int argc, char **argv)
 		while (running) {
 			enum fe_status status = 0;
 
+			check_quit_key();
 			if (ioctl(fe_fd, FE_READ_STATUS, &status) < 0) {
 				perror("FE_READ_STATUS");
 				break;
@@ -399,6 +444,8 @@ int main(int argc, char **argv)
 	fprintf(stderr, "\nStopping.\n");
 
 out:
+	restore_terminal();
+
 	/*
 	 * Always try this, even on an early error path before the main
 	 * loop - alp_iface_up only actually gates whether we succeeded
