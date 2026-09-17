@@ -7,7 +7,7 @@
  * the associated atscN network interface on lock, and keeps running
  * until interrupted.
  *
- * Usage: atsc3-zap <freq_hz> [--plp <id>] [-a <adapter>] [-f <frontend>] [-r]
+ * Usage: atsc3-zap <freq_hz> [--plp <id>[,<id>...]] [-a <adapter>] [-f <frontend>] [-r]
  *
  * Copyright (c) 2026 Yoonji Park <koreapyj@dcmys.kr>
  */
@@ -52,10 +52,11 @@ static void signal_handler(int sig)
 static void usage(const char *prog)
 {
 	fprintf(stderr,
-		"Usage: %s <freq_hz> [--plp <id>] [-a <adapter>] [-f <frontend>] [-r]\n"
+		"Usage: %s <freq_hz> [--plp <id>[,<id>...]] [-a <adapter>] [-f <frontend>] [-r]\n"
 		"\n"
 		"  <freq_hz>       RF frequency in Hz (e.g. 599000000)\n"
-		"  --plp <id>      PLP ID 0-63 (omit for all PLPs)\n"
+		"  --plp <id>[,..] PLP ID(s) 0-63, comma-separated for a bonded\n"
+		"                  set (e.g. --plp 0,1); omit for all PLPs\n"
 		"  -a <adapter>    DVB adapter number (default 0)\n"
 		"  -f <frontend>   Frontend number (default 0)\n"
 		"  -r              Record full TS to stdout\n",
@@ -84,11 +85,35 @@ int main(int argc, char **argv)
 
 	for (i = 2; i < argc; i++) {
 		if (strcmp(argv[i], "--plp") == 0 && i + 1 < argc) {
-			stream_id = strtoul(argv[++i], NULL, 0);
-			if (stream_id > 63) {
-				fprintf(stderr, "PLP ID must be 0-63\n");
+			/*
+			 * comma-separated list of up to 4 PLP IDs (e.g.
+			 * "0,1" for a bonded pair), packed one per byte into
+			 * stream_id - matches the driver's OREGD_PLP_ID_0..3
+			 * register layout directly. A bare single ID keeps
+			 * working unchanged.
+			 */
+			char *list = argv[++i];
+			char *tok = strtok(list, ",");
+			int slot = 0;
+
+			stream_id = 0;
+			while (tok && slot < 4) {
+				unsigned long id = strtoul(tok, NULL, 0);
+
+				if (id > 63) {
+					fprintf(stderr, "PLP ID must be 0-63: %s\n", tok);
+					return 1;
+				}
+				stream_id |= (id & 0xFF) << (slot * 8);
+				slot++;
+				tok = strtok(NULL, ",");
+			}
+			if (slot == 0) {
+				fprintf(stderr, "No PLP IDs given\n");
 				return 1;
 			}
+			for (; slot < 4; slot++)
+				stream_id |= 0xFFUL << (slot * 8);
 		} else if (strcmp(argv[i], "-a") == 0 && i + 1 < argc) {
 			adapter = atoi(argv[++i]);
 		} else if (strcmp(argv[i], "-f") == 0 && i + 1 < argc) {
