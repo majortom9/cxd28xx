@@ -25,9 +25,17 @@
 #include <linux/dvb/frontend.h>
 #include <linux/dvb/dmx.h>
 
-#ifndef SYS_ATSC3
-#define SYS_ATSC3 35
-#endif
+/*
+ * NOT koreapyj's value (35, his own private compat #define for an
+ * out-of-tree driver). This tree added SYS_ATSC3 as a real local enum
+ * member in include/uapi/linux/dvb/frontend.h, positioned right after
+ * SYS_DCII - which computes to 21, not 35. Since it's a genuine enum
+ * member rather than a macro, `#ifndef SYS_ATSC3` can never detect it
+ * (the preprocessor has no visibility into enum constants), so
+ * koreapyj's original #ifndef guard here would always fire and
+ * silently send the wrong wire value to this driver. Removed entirely
+ * - the real enum value from <linux/dvb/frontend.h> is used directly.
+ */
 
 #ifndef NO_STREAM_ID_FILTER
 #define NO_STREAM_ID_FILTER (~0U)
