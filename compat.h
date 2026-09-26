@@ -9,9 +9,21 @@
 
 #include <linux/version.h>
 
-/* ATSC 3.0 delivery system (not in kernel) */
-#ifndef SYS_ATSC3
-#define SYS_ATSC3 35
-#endif
+/*
+ * 2026-09-25: removed the "#ifndef SYS_ATSC3 / #define SYS_ATSC3 35" shim
+ * that used to live here. #ifndef only detects preprocessor macros - it
+ * has no visibility into a C enum member, and the real SYS_ATSC3 is an
+ * enum value (added locally to <linux/dvb/frontend.h> for this project's
+ * ATSC3 kernel patch, not a #define). That meant the #ifndef was *always*
+ * true and this shim *always* fired, silently overriding the real,
+ * correct value (21) with the wrong one (35) even when building against
+ * this project's own patched kernel, which always has it. Confirmed live:
+ * dvb_core's dvbv5_set_delivery_system() rejected every ATSC3 tune
+ * attempt with "Delivery system 21 not supported" - runtime dump of the
+ * frontend's own delsys[] array showed 35 sitting where SYS_ATSC3 (21)
+ * belonged, byte-for-byte matching this shim's wrong value. This project
+ * always builds against a kernel where the real enum value exists, so
+ * there is nothing left for this shim to compat-shim.
+ */
 
 #endif /* _CXD28XX_COMPAT_H_ */
