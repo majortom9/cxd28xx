@@ -4619,6 +4619,15 @@ static int cxd2878_set_atsc3(struct dvb_frontend *fe)
 	if(dev->base->config->LED_switch)
 		dev->base->config->LED_switch(dev->base->i2c,3);
 
+	/*
+	 * ATSC 3.0 channels are 6, 7 or 8 MHz. Tuning apps often leave the
+	 * bandwidth unset (0) for ATSC, which would make dev->bandwidth
+	 * SONY_DTV_BW_UNKNOWN and index nominalRate[] and friends in
+	 * SLtoAA3_BandSetting() with (0 - SONY_DTV_BW_6_MHZ) - a kernel oops.
+	 */
+	if (c->bandwidth_hz != 7000000 && c->bandwidth_hz != 8000000)
+		c->bandwidth_hz = 6000000;
+
 	dev->bandwidth = (enum sony_dtv_bandwidth_t)(c->bandwidth_hz/1000000);
 
 	{
@@ -4692,21 +4701,46 @@ static int cxd2878_set_atsc3(struct dvb_frontend *fe)
 		 *  <SLV-T>   93h     83h    [7]    1'b0      1'bx           OREGD_PLP_ID_3_VALID
 		 *  <SLV-T>   93h     83h    [5:0]  6'd00     6'dxx          OREGD_PLP_ID_3[5:0]
 		 */
+		/*
+		 * c->stream_id packs up to 4 PLP IDs, one per byte (LSB first),
+		 * 0xFF = unused slot, so atsc3-zap's --plp 0,1 can fill a bonded
+		 * set. A bare single ID is byte0=id, bytes1-3=0xFF - the same
+		 * as the old single-PLP encoding. Slot 0 defaults to 0x80
+		 * (VALID=1, ID=0), the documented reset value: marking every
+		 * slot invalid for auto mode stops it locking at all.
+		 */
 		u8 plpids[] = { 0x80, 0x00, 0x00, 0x00 };
+		bool any_strict = false;
+		int i;
+
 		if (c->stream_id != NO_STREAM_ID_FILTER) {
-			plpids[0] = 0x80 | (c->stream_id & 0x3F);
+			for (i = 0; i < 4; i++) {
+				u8 id = (c->stream_id >> (i * 8)) & 0xFF;
+
+				if (id <= 0x3F) {
+					plpids[i] = 0x80 | id;
+					any_strict = true;
+				}
+			}
+		}
+
+		/* PLP_ID array before the mode flag, as the vendor driver does
+		 * (sony_cxd6801_demod_atsc3_SetPLPConfig). */
+		cxd2878_wrm(dev, dev->slvt, 0x80, plpids, 4);
+
+		dev->atsc3_plp_auto_pending = !any_strict;
+		if (any_strict) {
 			dev_info(&dev->base->i2c->dev,
-				"%s: ATSC3 PLP %u selected (strict)\n",
-				KBUILD_MODNAME, c->stream_id & 0x3F);
+				"%s: ATSC3 PLP %02x %02x %02x %02x selected (strict)\n",
+				KBUILD_MODNAME, plpids[0], plpids[1], plpids[2], plpids[3]);
 			cxd2878_wr(dev, dev->slvt, 0x85, 0x00);
 		}
 		else {
 			dev_info(&dev->base->i2c->dev,
-				"%s: ATSC3 PLP auto (all PLPs)\n",
+				"%s: ATSC3 PLP auto - selecting carried PLPs after lock\n",
 				KBUILD_MODNAME);
 			cxd2878_wr(dev, dev->slvt, 0x85, 0x01);
 		}
-		cxd2878_wrm(dev, dev->slvt, 0x80, plpids, 4);
 
 		/* Make IPLPINFO_RDY low for changing PLP without re-tuning case
 		 *
@@ -4949,6 +4983,75 @@ err:
 	return ret;
 }
 
+/*
+ * Auto PLP (no stream_id given). OREG_PLP_ID_AUTO only corrects the PLP ID
+ * when a channel carries a single PLP, so on a multi-PLP station auto mode
+ * delivers PLP 0 alone - often nothing but LLS signalling. Once L1-Detail
+ * is decoded, select the PLPs the channel actually carries, up to the
+ * demod's 4 slots with LLS-carrying PLPs first, using the SDK's own
+ * SetPLPConfig sequence (IDs, then OREGD_PLPINFO_UPD). A fixed list such
+ * as 0-3 can't be used: an ID the channel doesn't carry sets IPLP_SEL_ERR
+ * and ALP output stops. Caller holds i2c_lock.
+ */
+static void cxd2878_atsc3_auto_plp(struct cxd2878_dev *dev)
+{
+	u8 data[36];
+	u8 ids[4] = { 0 };
+	int carried = 0, n = 0, pass, i;
+
+	/*
+	 *  <SLV-T>  93h  10h      [1]  IL1D_OK
+	 *  <SLV-T>  93h  9Dh      [0]  IPLPINFO_RDY
+	 *  <SLV-T>  93h  9Eh      [0]  IPLPINFO_CHG
+	 *  <SLV-T>  93h  A0h-A7h       IL1D_PLP00..63 (bit 7 = lowest ID)
+	 *  <SLV-T>  93h  A8h-AFh       IL1D_LLS00..63
+	 */
+	cxd2878_wr(dev, dev->slvt, 0x00, 0x93);
+	if (cxd2878_rdm(dev, dev->slvt, 0x10, data, 1) || !(data[0] & 0x02))
+		return;
+	if (cxd2878_rdm(dev, dev->slvt, 0x9D, data, sizeof(data)))
+		return;
+	if (!(data[0] & 0x01))
+		return;
+	if (data[1] & 0x01) {
+		/* list is being updated: request the new one, retry next poll */
+		cxd2878_wr(dev, dev->slvt, 0x9C, 0x01);
+		return;
+	}
+
+	for (pass = 0; pass < 2; pass++) {
+		for (i = 0; i < 64; i++) {
+			u8 bit = 0x80 >> (i % 8);
+			bool lls = data[11 + i / 8] & bit;
+
+			if (!(data[3 + i / 8] & bit) || lls != (pass == 0))
+				continue;
+			carried++;
+			if (n < 4)
+				ids[n++] = i;
+		}
+	}
+
+	dev->atsc3_plp_auto_pending = false;
+
+	if (carried <= 1) {
+		dev_info(&dev->base->i2c->dev,
+			"%s: ATSC3 auto PLP: single PLP, hardware auto-select\n",
+			KBUILD_MODNAME);
+		return;
+	}
+
+	for (i = 0; i < 4; i++)
+		data[i] = i < n ? 0x80 | ids[i] : 0x00;
+	cxd2878_wrm(dev, dev->slvt, 0x80, data, 4);
+	cxd2878_wr(dev, dev->slvt, 0x9C, 0x01);
+
+	dev_info(&dev->base->i2c->dev,
+		"%s: ATSC3 auto PLP: channel carries %d PLPs, selected %*phC%s\n",
+		KBUILD_MODNAME, carried, n, ids,
+		carried > 4 ? " (demod limit is 4)" : "");
+}
+
 static int cxd2878_read_status(struct dvb_frontend *fe,
 											enum fe_status *status)
 {
@@ -5082,6 +5185,10 @@ static int cxd2878_read_status(struct dvb_frontend *fe,
 			if((tslockstat)&(!unlockdetected)&(syncstat>=6))
 				*status = FE_HAS_SIGNAL | FE_HAS_CARRIER | FE_HAS_VITERBI |
 						FE_HAS_SYNC | FE_HAS_LOCK;
+			/* ALP lock isn't required: with only PLP 0 selected there
+			 * may be little or nothing to lock on. */
+			if (dev->atsc3_plp_auto_pending && !unlockdetected && syncstat >= 6)
+				cxd2878_atsc3_auto_plp(dev);
 			break;
 		default:
 			ret = -EINVAL;
@@ -5699,10 +5806,80 @@ static void cxd2878_release (struct dvb_frontend*fe)
 	kfree(dev);
 }
 
+/*
+ * FE_GET_SPECTRUM_SCAN only exists in dvb-core trees carrying the
+ * updatelee spectrum-scan extension; stock kernels build without it.
+ */
+#ifdef FE_GET_SPECTRUM_SCAN
+#define CXD2878_EXTENDED_CAPS FE_HAS_EXTENDED_CAPS
+
+/*
+ * Swept-RSSI spectrum scan: tune the tuner LO to each requested frequency
+ * and read its AGC back as dBm. No demod lock is needed per step, but a
+ * bare tuner tune alone returns identical readings everywhere - the AGC
+ * is only live after a full acquisition sequence (SLtoAA3 et al, via
+ * cxd2878_set_frontend()), so bootstrap with one real ATSC3 tune at the
+ * first frequency and sweep on top of that state. Readings show where
+ * real channels are; they are not calibrated to dBm accuracy.
+ */
+static int cxd2878_get_spectrum_scan(struct dvb_frontend *fe,
+				      struct dvb_fe_spectrum_scan *s)
+{
+	struct cxd2878_dev *dev = fe->demodulator_priv;
+	struct dtv_frontend_properties *c = &fe->dtv_property_cache;
+	bool ascot3 = SONY_TUNER_IS_ASCOT3(dev->chipid);
+	int x;
+	s32 rssi;
+
+	if (!ascot3 && !SONY_TUNER_IS_FRIEA(dev->chipid))
+		return -EOPNOTSUPP;
+
+	*s->type = SC_DBM;
+
+	c->delivery_system = SYS_ATSC3;
+	c->frequency = s->freq[0];
+	c->bandwidth_hz = 6000000;
+	cxd2878_set_frontend(fe);
+
+	dev->system = SONY_DTV_SYSTEM_ATSC3;
+	dev->bandwidth = SONY_DTV_BW_6_MHZ;
+
+	mutex_lock(&dev->base->i2c_lock);
+	cxd2878_i2c_repeater(dev, 1);
+	for (x = 0; x < s->num_freq; x++) {
+		u32 freq_khz = s->freq[x] / 1000;
+
+		if (ascot3)
+			ascot3_tune(dev, freq_khz);
+		else
+			freia_tune(dev, freq_khz);
+		/* AGC settling after the jump; read immediately it is nearly flat */
+		msleep(20);
+		if (ascot3)
+			ascot3_read_rssi(dev, freq_khz, &rssi);
+		else
+			freia_read_rssi(dev, freq_khz, &rssi);
+		/* hundredths of a dB -> thousandths, the SC_DBM convention */
+		s->rf_level[x] = rssi * 10;
+	}
+	cxd2878_i2c_repeater(dev, 0);
+	mutex_unlock(&dev->base->i2c_lock);
+
+	return 0;
+}
+#else
+#define CXD2878_EXTENDED_CAPS 0
+#endif
+
 static const struct dvb_frontend_ops cxd2878_ops = {
+	/*
+	 * DTV_ENUM_DELSYS reports this array in declaration order, and
+	 * updateDVB reads it backwards, so the LAST entry becomes its default
+	 * delivery system - keep SYS_ATSC last so plain ATSC stays the default.
+	 */
 	.delsys = {SYS_DVBT,SYS_DVBT2,SYS_ISDBT,
 		SYS_DVBC_ANNEX_A,SYS_DVBC_ANNEX_B,SYS_DVBC_ANNEX_C,
-		SYS_ATSC,SYS_ATSC3},
+		SYS_ATSC3,SYS_ATSC},
 	.info = {
 			.name = "sony cxd2878 familly",
 			.frequency_min_hz = 45*MHz,
@@ -5726,8 +5903,14 @@ static const struct dvb_frontend_ops cxd2878_ops = {
 				FE_CAN_GUARD_INTERVAL_AUTO |
 				FE_CAN_2G_MODULATION |
 				FE_CAN_RECOVER |
-				FE_CAN_MUTE_TS,
+				FE_CAN_MUTE_TS |
+				CXD2878_EXTENDED_CAPS,
 	},
+#ifdef FE_GET_SPECTRUM_SCAN
+	.extended_info = {
+		.extended_caps		= FE_CAN_SPECTRUMSCAN
+	},
+#endif
 
 			.init 					= cxd2878_init,
 			.sleep				= cxd2878_sleep_fe,
@@ -5741,6 +5924,9 @@ static const struct dvb_frontend_ops cxd2878_ops = {
 			.read_ber  				= cxd2878_read_ber,
 			.read_snr				= cxd2878_read_snr,
 			.read_ucblocks			= cxd2878_read_ucblocks,
+#ifdef FE_GET_SPECTRUM_SCAN
+			.get_spectrum_scan		= cxd2878_get_spectrum_scan,
+#endif
 };
 
 static struct cxd_base *match_base(struct i2c_adapter *i2c,u8 adr)

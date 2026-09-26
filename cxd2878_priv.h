@@ -360,6 +360,7 @@ struct cxd2878_dev {
 	u32 atscSignalThresh;
 	u32 tune_time;
 	enum sony_demod_output_atsc3_t atsc3Output;
+	bool atsc3_plp_auto_pending;	/* auto PLP: select carried PLPs once L1-Detail is in */
 
 	/* ALP-div-TS decap state */
 	struct net_device   *alpdev;          /* set by bridge for carrier control */
