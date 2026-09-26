@@ -12,6 +12,8 @@
 #include <linux/firmware.h>
 #include <linux/delay.h>
 #include <linux/miscdevice.h>
+#include <linux/netdevice.h>
+#include <linux/rtnetlink.h>
 #include <media/dvb_frontend.h>
 #include <media/dmxdev.h>
 #include <media/dvb_demux.h>
@@ -173,6 +175,7 @@ struct it930x_fe_ctx {
 
 	/* Hardware PID filter state */
 	u16			pid_table[IT930X_PID_FILTER_MAX];
+	u8			pid_refs[IT930X_PID_FILTER_MAX];
 	bool			pid_filter_active;
 	int			wildcard_feeds;
 
@@ -647,9 +650,6 @@ static int it930x_i2c_write(struct it930x_dev *dev, u8 bus, u8 slave,
 	if (len <= IT930X_I2C_SHORT_MAX)
 		return it930x_i2c_generic_write(dev, bus, slave, buf, len);
 
-	if (len > U8_MAX)
-		return -E2BIG;
-
 	/* Stage long write into bridge buffer */
 	while (remaining) {
 		chunk = min_t(u32, remaining, IT930X_I2C_STAGE_CHUNK);
@@ -682,9 +682,6 @@ static int it930x_i2c_read(struct it930x_dev *dev, u8 bus, u8 slave,
 
 	if (len <= IT930X_I2C_SHORT_MAX)
 		return it930x_i2c_generic_read(dev, bus, slave, buf, len);
-
-	if (len > U8_MAX)
-		return -E2BIG;
 
 	/* Trigger I2C read */
 	trig[0] = 0xf5;
@@ -1270,11 +1267,27 @@ static int it930x_start_streaming(struct it930x_dev *dev)
 		return ret;
 	}
 
-	/* Flush stale data from bridge FIFO */
-	usb_bulk_msg(dev->udev,
-		     usb_rcvbulkpipe(dev->udev, IT930X_EP_TS),
-		     dev->urb_bufs[0], IT930X_URB_BUF_SIZE,
-		     &flush_len, 100);
+	/*
+	 * Drain what the bridge buffered while no URBs were queued - several
+	 * buffers' worth, not one. Left in, it is delivered faster than real
+	 * time on restart (inflating any bitrate measured from a fresh feed)
+	 * and can be the previous channel's data after a retune. Backlog reads
+	 * complete almost instantly; once caught up, a full buffer of live
+	 * data takes far longer (~27ms at 19.4Mbit/s), so stop at the first
+	 * slow or short read.
+	 */
+	for (i = 0; i < 64; i++) {
+		ktime_t t = ktime_get();
+
+		if (usb_bulk_msg(dev->udev,
+				 usb_rcvbulkpipe(dev->udev, IT930X_EP_TS),
+				 dev->urb_bufs[0], IT930X_URB_BUF_SIZE,
+				 &flush_len, 100) ||
+		    flush_len < IT930X_URB_BUF_SIZE ||
+		    ktime_ms_delta(ktime_get(), t) > 5)
+			break;
+	}
+	dev_dbg(&dev->intf->dev, "flushed %d stale buffers\n", i);
 
 	/* Reset stats */
 	dev->urb_complete_ok = 0;
@@ -1512,6 +1525,18 @@ static int it930x_pid_filter_set_mode(struct it930x_dev *dev, u8 port,
 
 /* -------- DVB demux -------- */
 
+/*
+ * The hardware PID filter only pays off when several tuners share one USB
+ * link. Filtered down to a few low-rate PIDs (PAT, PSIP), a 65KB URB takes
+ * seconds to fill, so section data reaches the demux too late - updateDVB
+ * gave up waiting for the PAT. A single tuner's full TS fits USB 2.0
+ * easily, and dvb_demux filters it in software.
+ */
+static bool it930x_use_hw_pid_filter(const struct it930x_dev *dev)
+{
+	return dev->board->num_frontends > 1;
+}
+
 static int it930x_start_feed(struct dvb_demux_feed *feed)
 {
 	struct it930x_fe_ctx *ife = feed->demux->priv;
@@ -1544,14 +1569,16 @@ static int it930x_start_feed(struct dvb_demux_feed *feed)
 		mutex_lock(&dev->io_lock);
 		ret = it930x_pid_filter_reset(dev, port);
 		if (!ret)
-			ret = it930x_pid_filter_set_mode(dev, port, true);
+			ret = it930x_pid_filter_set_mode(dev, port,
+							 it930x_use_hw_pid_filter(dev));
 		mutex_unlock(&dev->io_lock);
 		if (ret) {
 			ife->feeding--;
 			return ret;
 		}
-		ife->pid_filter_active = true;
+		ife->pid_filter_active = it930x_use_hw_pid_filter(dev);
 		memset(ife->pid_table, 0xff, sizeof(ife->pid_table));
+		memset(ife->pid_refs, 0, sizeof(ife->pid_refs));
 	}
 
 	if (pid == 0x2000) {
@@ -1563,11 +1590,20 @@ static int it930x_start_feed(struct dvb_demux_feed *feed)
 			mutex_unlock(&dev->io_lock);
 			ife->pid_filter_active = false;
 		}
-	} else if (ife->pid_filter_active) {
-		/* Add specific PID to hardware filter */
+	} else if (it930x_use_hw_pid_filter(dev)) {
+		/*
+		 * Record the PID even while a wildcard feed has the hardware
+		 * filter off: when that wildcard stops the filter comes back
+		 * on, and any PID missing from the table would silently stop
+		 * reaching its section/PES filter (updateDVB's PAT/PSIP parse
+		 * never completed because of this). Refcounted, since the same
+		 * PID can have more than one feed.
+		 */
 		for (i = 0; i < IT930X_PID_FILTER_MAX; i++) {
-			if (ife->pid_table[i] == pid)
-				return 0; /* already in table */
+			if (ife->pid_table[i] == pid) {
+				ife->pid_refs[i]++;
+				return 0;
+			}
 		}
 		for (i = 0; i < IT930X_PID_FILTER_MAX; i++) {
 			if (ife->pid_table[i] == 0xffff) {
@@ -1577,6 +1613,7 @@ static int it930x_start_feed(struct dvb_demux_feed *feed)
 				if (ret)
 					return ret;
 				ife->pid_table[i] = pid;
+				ife->pid_refs[i] = 1;
 				break;
 			}
 		}
@@ -1596,20 +1633,22 @@ static int it930x_stop_feed(struct dvb_demux_feed *feed)
 
 	if (pid == 0x2000) {
 		/* Wildcard feed stopped: re-enable filter if no more wildcards */
-		if (--ife->wildcard_feeds == 0 && ife->feeding > 1) {
+		if (--ife->wildcard_feeds == 0 && ife->feeding > 1 &&
+		    it930x_use_hw_pid_filter(dev)) {
 			mutex_lock(&dev->io_lock);
 			it930x_pid_filter_set_mode(dev, port, true);
 			mutex_unlock(&dev->io_lock);
 			ife->pid_filter_active = true;
 		}
-	} else if (ife->pid_filter_active) {
-		/* Remove specific PID from hardware filter */
+	} else if (it930x_use_hw_pid_filter(dev)) {
 		for (i = 0; i < IT930X_PID_FILTER_MAX; i++) {
 			if (ife->pid_table[i] == pid) {
-				mutex_lock(&dev->io_lock);
-				it930x_pid_filter_remove(dev, port, i);
-				mutex_unlock(&dev->io_lock);
-				ife->pid_table[i] = 0xffff;
+				if (--ife->pid_refs[i] == 0) {
+					mutex_lock(&dev->io_lock);
+					it930x_pid_filter_remove(dev, port, i);
+					mutex_unlock(&dev->io_lock);
+					ife->pid_table[i] = 0xffff;
+				}
 				break;
 			}
 		}
@@ -2095,16 +2134,48 @@ static const struct file_operations it930x_sc_fops = {
 	.unlocked_ioctl	= it930x_sc_ioctl,
 };
 
+static int it930x_alp_open(void *priv);
 static void it930x_alp_stop(void *priv);
 
+/*
+ * The ALP feed is created by the alp netdev's ndo_open and dropped here
+ * whenever the frontend sleeps. Both run under rtnl_lock so this and
+ * ip link up/down can't race over ife->alp_feed.
+ */
 static int it930x_fe_sleep(struct dvb_frontend *fe)
 {
 	struct it930x_fe_ctx *ife = fe->dvb->priv;
 
+	rtnl_lock();
 	it930x_alp_stop(ife);
+	rtnl_unlock();
 
 	if (ife->fe_ops_orig.sleep)
 		return ife->fe_ops_orig.sleep(fe);
+	return 0;
+}
+
+/*
+ * If the interface was left up across a sleep (e.g. a tuning app that
+ * reopens the frontend, unlike atsc3-zap which raises it only after lock),
+ * nothing would recreate the feed and it would carry no packets while
+ * still showing UP. Restore it on wake.
+ */
+static int it930x_fe_init(struct dvb_frontend *fe)
+{
+	struct it930x_fe_ctx *ife = fe->dvb->priv;
+	int ret = 0;
+
+	if (ife->fe_ops_orig.init)
+		ret = ife->fe_ops_orig.init(fe);
+	if (ret || !ife->alp)
+		return ret;
+
+	rtnl_lock();
+	if (netif_running(alp_get_netdev(ife->alp)))
+		it930x_alp_open(ife);
+	rtnl_unlock();
+
 	return 0;
 }
 
@@ -2148,6 +2219,7 @@ static int it930x_frontend_attach(struct it930x_fe_ctx *ife)
 
 	ife->fe_ops_orig = ife->fe->ops;
 	ife->fe->ops.sleep = it930x_fe_sleep;
+	ife->fe->ops.init = it930x_fe_init;
 
 	return 0;
 }
@@ -2279,6 +2351,9 @@ static int it930x_alp_open(void *priv)
 	struct dmx_ts_feed *feed;
 	int ret;
 
+	if (ife->alp_feed)
+		return 0;
+
 	ret = ife->demux.dmx.allocate_ts_feed(&ife->demux.dmx, &feed,
 					       it930x_alp_ts_cb);
 	if (ret)
@@ -2361,6 +2436,19 @@ static int it930x_dvb_init(struct it930x_dev *dev)
 				i, ret);
 			goto err_unwind;
 		}
+		/*
+		 * 2026-09-25: it930x_fe_sleep() reads fe->dvb->priv expecting
+		 * it to be this frontend's own ife context, but nothing ever
+		 * set it - dvb_register_adapter() does not take or assign a
+		 * priv pointer itself. Left NULL, every call into
+		 * it930x_fe_sleep() (routine dvb_frontend_thread sleep/stop
+		 * handling, not just on tune failure) dereferences a NULL
+		 * ife inside it930x_alp_stop() and oopses. Confirmed live via
+		 * a real NULL pointer dereference in it930x_alp_stop+0xd,
+		 * called from it930x_fe_sleep, from the kdvb-ad-*-fe-0 kernel
+		 * thread.
+		 */
+		ife->adapter.priv = ife;
 
 		ret = it930x_frontend_attach(ife);
 		if (ret)
@@ -2710,6 +2798,30 @@ static const struct usb_device_id it930x_id_table[] = {
 	{ USB_DEVICE(0x23e2, 0x2b02), .driver_info = (kernel_ulong_t)
 	  &(const struct it930x_board_cfg){	/* Zenview HDTV Mate */
 		.name		= "Zenview HDTV Mate",
+		.fw_file	= "dvb-usb-hdtvmate.fw",
+		.num_frontends	= 1,
+		.fe		= {
+			{ .ts_port = 0, .i2c_bus = 3,
+			  .demod_addr = 0x6c, .tuner_addr = 0x60 },
+		},
+		.gpio_reset	= 2,
+		.gpio_always_hi	= 14,
+		.i2c_notify	= 0x38,
+		.tuner_xtal	= SONY_ASCOT3_XTAL_24000KHz,
+	  }
+	},
+	{ USB_DEVICE(0x048d, 0x9306), .driver_info = (kernel_ulong_t)
+	  &(const struct it930x_board_cfg){
+		/* 2026-09-25: same physical board as the Zenview HDTV Mate
+		 * above (GTMEDIA HDTV Mate) - ships under ITE's own generic
+		 * IT930x reference-design USB ID (048d:9306) instead of a
+		 * rebranded one. Board config confirmed independently this
+		 * session via af9035.c's own cxd2878 fallback path
+		 * (state->cxd2878_cfg.addr_slvt = 0x6c, same demod_addr;
+		 * firmware MD5 already confirmed identical to
+		 * dvb-usb-hdtvmate.fw), not guessed.
+		 */
+		.name		= "GTMEDIA HDTV Mate (generic IT930x ID)",
 		.fw_file	= "dvb-usb-hdtvmate.fw",
 		.num_frontends	= 1,
 		.fe		= {
