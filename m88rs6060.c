@@ -3495,6 +3495,7 @@ static int m88rs6060_probe(struct i2c_client *client)
 		priv = kzalloc(sizeof(*priv), GFP_KERNEL);
 		if (!priv) {
 			ret = -ENOMEM;
+			goto err_regmap_exit;
 		}
 		base1 = match_si5351_base(client->adapter,cfg->clk_port);
 		if(base1){
