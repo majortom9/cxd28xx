@@ -86,48 +86,21 @@ static void set_raw_terminal(void)
 }
 
 /*
- * cxd2878.c only ever refreshes RSSI/SNR from hardware on the call that
- * first reports FE_HAS_LOCK; after that it stays on the last known values
- * until userspace explicitly asks for a new reading here. Each refresh is
- * a ~75ms burst of blocking I2C/USB round-trips (measured live), long
- * enough on its own to stall the TS-data bulk read and cause real packet
- * loss - so unlike the lock-bit check (cheap, polled every loop), this is
- * opt-in only: press Enter or Space to request one fresh reading.
+ * 'q' quits; Enter or Space asks for a stats line. Returns 1 for a stats
+ * request.
  */
-static void request_rssi_snr_refresh(const char *path)
-{
-	static int warned;
-	int fd;
-
-	if (!path || !*path)
-		return;
-
-	fd = open(path, O_WRONLY);
-	if (fd < 0) {
-		if (!warned) {
-			fprintf(stderr,
-				"Note: couldn't open %s to request an RSSI/SNR refresh: %s\n",
-				path, strerror(errno));
-			warned = 1;
-		}
-		return;
-	}
-	if (write(fd, "1", 1) != 1)
-		perror("write refresh_rssi_snr");
-	close(fd);
-}
-
-static void check_quit_key(const char *refresh_path)
+static int check_key(void)
 {
 	char ch;
 
 	if (read(STDIN_FILENO, &ch, 1) != 1)
-		return;
+		return 0;
 
 	if (ch == 'q' || ch == 'Q')
 		running = 0;
 	else if (ch == '\n' || ch == '\r' || ch == ' ')
-		request_rssi_snr_refresh(refresh_path);
+		return 1;
+	return 0;
 }
 
 /*
@@ -252,7 +225,7 @@ int main(int argc, char **argv)
 	unsigned int freq = 0, bw = 6000000;
 	unsigned int stream_id = NO_STREAM_ID_FILTER;
 	int adapter = 0, frontend = 0, record = 0;
-	char fe_path[64], alp_ifname[IFNAMSIZ], refresh_path[80];
+	char fe_path[64], alp_ifname[IFNAMSIZ];
 	int alp_iface_up = 0;
 	int fe_fd, dmx_fd = -1, dvr_fd = -1, i;
 
@@ -314,9 +287,6 @@ int main(int argc, char **argv)
 	/* Open frontend */
 	snprintf(fe_path, sizeof(fe_path),
 		 "/dev/dvb/adapter%d/frontend%d", adapter, frontend);
-	snprintf(refresh_path, sizeof(refresh_path),
-		 "/sys/kernel/debug/cxd2878-adapter%d/refresh_rssi_snr",
-		 adapter);
 	fe_fd = open(fe_path, O_RDWR);
 	if (fe_fd < 0) {
 		fprintf(stderr, "Cannot open %s: %s\n", fe_path, strerror(errno));
@@ -427,7 +397,7 @@ int main(int argc, char **argv)
 		while (running) {
 			enum fe_status status = 0;
 
-			check_quit_key(refresh_path);
+			check_key();
 			if (ioctl(fe_fd, FE_READ_STATUS, &status) == 0 &&
 			    (status & FE_HAS_LOCK))
 				bring_up_alp_on_lock(alp_ifname, sizeof(alp_ifname), &alp_iface_up);
@@ -447,23 +417,28 @@ int main(int argc, char **argv)
 			}
 		}
 	} else {
-		time_t last_stats = 0;
+		/*
+		 * Stats are read once when lock is (re)acquired and then only
+		 * on request (Enter/Space), not on a timer: every stats read is
+		 * a burst of I2C traffic to the demod over the same USB link
+		 * that carries the stream.
+		 */
+		int want_stats = 1;
 
 		while (running) {
 			enum fe_status status = 0;
 
-			check_quit_key(refresh_path);
+			if (check_key())
+				want_stats = 1;
 			if (ioctl(fe_fd, FE_READ_STATUS, &status) < 0) {
 				perror("FE_READ_STATUS");
 				break;
 			}
 
 			if (status & FE_HAS_LOCK) {
-				time_t now = time(NULL);
-
 				bring_up_alp_on_lock(alp_ifname, sizeof(alp_ifname), &alp_iface_up);
 
-				if (now - last_stats >= 5) {
+				if (want_stats) {
 					struct dtv_property props[3];
 					struct dtv_properties cmd;
 
@@ -492,12 +467,13 @@ int main(int argc, char **argv)
 					} else {
 						fprintf(stderr, "Locked.\n");
 					}
-					last_stats = now;
+					want_stats = 0;
 				}
 				usleep(500000);
 			} else {
-				fprintf(stderr, "Lock lost.\n");
-				last_stats = 0;
+				if (!want_stats)
+					fprintf(stderr, "Lock lost.\n");
+				want_stats = 1;
 				usleep(100000);
 			}
 		}
