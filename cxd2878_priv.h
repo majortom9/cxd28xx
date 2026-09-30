@@ -369,6 +369,9 @@ struct cxd2878_dev {
 	u32                 alp_buf_len;
 	bool                alp_active;
 	struct cxd2878_alp_ts_stats alp_ts_stats;
+
+	/* kept last: it930x shares this struct */
+	bool atsc3_modcod_pending;	/* log the PLPs' FEC/modulation/code rate on (re)lock */
 };
 
 #endif

@@ -4729,6 +4729,7 @@ static int cxd2878_set_atsc3(struct dvb_frontend *fe)
 		cxd2878_wrm(dev, dev->slvt, 0x80, plpids, 4);
 
 		dev->atsc3_plp_auto_pending = !any_strict;
+		dev->atsc3_modcod_pending = true;
 		if (any_strict) {
 			dev_info(&dev->base->i2c->dev,
 				"%s: ATSC3 PLP %02x %02x %02x %02x selected (strict)\n",
@@ -5052,6 +5053,77 @@ static void cxd2878_atsc3_auto_plp(struct cxd2878_dev *dev)
 		carried > 4 ? " (demod limit is 4)" : "");
 }
 
+/*
+ * Log the FEC type, modulation and code rate of each selected PLP, as
+ * sony_cxd6801_demod_atsc3_monitor_FecModCod() reads them. Returns false if
+ * L1-Detail isn't decoded yet, so the caller tries again on the next poll.
+ */
+static bool cxd2878_atsc3_log_modcod(struct cxd2878_dev *dev)
+{
+	static const char * const fec_name[] = {
+		"BCH+LDPC 16K", "BCH+LDPC 64K", "CRC+LDPC 16K", "CRC+LDPC 64K",
+		"LDPC 16K", "LDPC 64K",
+	};
+	static const char * const mod_name[] = {
+		"QPSK", "16QAM-NUC", "64QAM-NUC", "256QAM-NUC", "1024QAM-NUC",
+		"4096QAM-NUC",
+	};
+	u8 slot[6], fmc[6], rdy;
+	int i, logged = 0;
+
+	/*
+	 *  <SLV-T>  93h  10h      [1]    IL1D_OK
+	 *  <SLV-T>  93h  9Dh      [0]    IPLPINFO_RDY
+	 *  <SLV-T>  93h  80h-83h  [7]    OREGD_PLP_ID_n_VALID, [5:0] PLP ID
+	 *  <SLV-T>  93h  84h      [0]    IPLP_SEL_ERR
+	 *  <SLV-T>  93h  85h      [0]    OREG_PLP_ID_AUTO
+	 *  <SLV-T>  93h  90h-91h         IL1D_PLP_FEC_TYPE_0..3 (4 bits each)
+	 *  <SLV-T>  93h  92h-93h         IL1D_PLP_MOD_0..3
+	 *  <SLV-T>  93h  94h-95h         IL1D_PLP_COD_0..3
+	 */
+	cxd2878_wr(dev, dev->slvt, 0x00, 0x93);
+	if (cxd2878_rdm(dev, dev->slvt, 0x10, &rdy, 1) || !(rdy & 0x02))
+		return false;
+	if (cxd2878_rdm(dev, dev->slvt, 0x9D, &rdy, 1) || !(rdy & 0x01))
+		return false;
+	if (cxd2878_rdm(dev, dev->slvt, 0x80, slot, sizeof(slot)) ||
+	    cxd2878_rdm(dev, dev->slvt, 0x90, fmc, sizeof(fmc)))
+		return false;
+
+	if (slot[4] & 0x01) {
+		/* the SDK treats hardware auto-select on a single-PLP channel
+		 * (slot 0 alone, OREG_PLP_ID_AUTO) as slot 0 being valid */
+		if (!((slot[0] & 0x80) && !(slot[1] & 0x80) &&
+		      !(slot[2] & 0x80) && !(slot[3] & 0x80) && (slot[5] & 0x01))) {
+			dev_info(&dev->base->i2c->dev,
+				"%s: ATSC3 PLP selection error, no FEC/modulation info\n",
+				KBUILD_MODNAME);
+			return true;
+		}
+		slot[1] = slot[2] = slot[3] = 0;
+	}
+
+	for (i = 0; i < 4; i++) {
+		u8 fec = (fmc[i / 2] >> (i % 2 ? 0 : 4)) & 0x0F;
+		u8 mod = (fmc[2 + i / 2] >> (i % 2 ? 0 : 4)) & 0x0F;
+		u8 cod = (fmc[4 + i / 2] >> (i % 2 ? 0 : 4)) & 0x0F;
+
+		if (!(slot[i] & 0x80))
+			continue;
+		logged++;
+		dev_info(&dev->base->i2c->dev,
+			"%s: ATSC3 PLP %u: %s, code rate %u/15, %s\n",
+			KBUILD_MODNAME, slot[i] & 0x3F,
+			mod < ARRAY_SIZE(mod_name) ? mod_name[mod] : "reserved modulation",
+			cod + 2,
+			fec < ARRAY_SIZE(fec_name) ? fec_name[fec] : "reserved FEC type");
+	}
+	if (!logged)
+		dev_info(&dev->base->i2c->dev,
+			"%s: ATSC3 no valid PLP selected\n", KBUILD_MODNAME);
+	return true;
+}
+
 static int cxd2878_read_status(struct dvb_frontend *fe,
 											enum fe_status *status)
 {
@@ -5189,6 +5261,12 @@ static int cxd2878_read_status(struct dvb_frontend *fe,
 			 * may be little or nothing to lock on. */
 			if (dev->atsc3_plp_auto_pending && !unlockdetected && syncstat >= 6)
 				cxd2878_atsc3_auto_plp(dev);
+			/* once per lock, after auto PLP has picked the final PLPs */
+			if (!(*status & FE_HAS_LOCK))
+				dev->atsc3_modcod_pending = true;
+			else if (dev->atsc3_modcod_pending && !dev->atsc3_plp_auto_pending &&
+				 cxd2878_atsc3_log_modcod(dev))
+				dev->atsc3_modcod_pending = false;
 			break;
 		default:
 			ret = -EINVAL;
