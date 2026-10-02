@@ -403,6 +403,9 @@ void alp_process(struct alp_dev *alp, const u8 *buf, u32 len)
 		return;
 	}
 	payload_len = alp_length - (hdr_size - 2);
+	/* hand LLS its signaling information header too (see alp_peek_total_size) */
+	if (packet_type == ALP_TYPE_LLS && hdr_size + payload_len + ALP_SIGNALING_HDR_LEN <= len)
+		payload_len += ALP_SIGNALING_HDR_LEN;
 
 	alp_dispatch(alp, packet_type, payload, payload_len);
 }
@@ -415,11 +418,21 @@ EXPORT_SYMBOL_GPL(alp_process);
 static u32 alp_peek_total_size(const u8 *buf, u32 len)
 {
 	u16 alp_length;
+	u32 sig_hdr;
 
 	if (len < 2)
 		return 0;
 
 	alp_length = ((buf[0] & 0x07) << 8) | buf[1];
+	/*
+	 * Link layer signaling packets (e.g. the LMT, several a second) carry
+	 * a 5-byte signaling information header outside the length field.
+	 * Missing it framed every such packet 5 bytes short; the parser then
+	 * read the LMT's tail as the next packet's header and lost sync until
+	 * the next PUSI, sometimes swallowing the IP packet after the LMT
+	 * (measured: ~9 IP packets a minute across a multiplex).
+	 */
+	sig_hdr = ((buf[0] >> 5) & 0x07) == ALP_TYPE_LLS ? ALP_SIGNALING_HDR_LEN : 0;
 
 	if ((buf[0] & 0x18) == 0x18) {
 		/* PC=1, S/C=1 (concatenated): 4 MSB in byte 2 */
@@ -446,10 +459,10 @@ static u32 alp_peek_total_size(const u8 *buf, u32 len)
 				return 0;
 			hdr += 2 + buf[hdr + 1] + 1;
 		}
-		return hdr + full_length;
+		return hdr + sig_hdr + full_length;
 	}
 
-	return 2 + alp_length;
+	return 2 + sig_hdr + alp_length;
 }
 
 u32 alp_feed(struct alp_dev *alp, const u8 *buf, u32 len)

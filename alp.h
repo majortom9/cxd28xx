@@ -24,6 +24,9 @@ struct device;
 #define ALP_TYPE_MPEG2_TS	7
 
 /* Link-layer signaling types (A/330 §6) */
+/* A/330 5.3: packet_type 100 (link layer signaling) carries a 40-bit
+ * signaling information header that the length field does not count */
+#define ALP_SIGNALING_HDR_LEN	5
 #define ALP_SIGTYPE_LMT		0x01	/* Link Mapping Table */
 #define ALP_SIGTYPE_RDT		0x02	/* ROHC-U Description Table */
 
